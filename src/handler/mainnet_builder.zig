@@ -442,38 +442,25 @@ pub const MainnetHandler = struct {
         // (which is common: floor=40/nonzero-byte vs standard=16/nonzero-byte calldata gas).
         var total_gas_spent = initial_gas.initial_gas + gas_spent;
 
-        // EIP-8037 (Amsterdam+): reservoir model — state gas beyond the reservoir spills into
-        // execution gas, increasing total_gas_spent and the sender's fee.
+        // EIP-8037 (Amsterdam+): exec state gas is always charged to the sender.
         //
-        // When gasLimit > TX_MAX_GAS_LIMIT (1<<24), the excess forms a "reservoir" that absorbs
-        // state gas first (invisible to EVM execution). Any state gas beyond the remaining
-        // reservoir capacity spills back into execution gas: total_gas_spent += spill.
-        // If the spill exceeds gas_remaining, the TX is retroactively OOG (all gas consumed).
+        // The sender's total payment = regular_exec_costs + exec_state_gas.
+        // exec_gas = gasLimit - initial_gas already includes any reservoir portion
+        // (gasLimit - TX_MAX_GAS_LIMIT), so gas_remaining after EVM execution implicitly
+        // buffers the state gas. We add exec_state_gas to total_gas_spent post-execution.
         //
-        // initial_state_gas is already included in initial_gas.initial_gas and draws from the
-        // reservoir first; only exec state gas (result.state_gas_used) needs the spill check.
+        // OOG check: if exec_state_gas exceeds gas_remaining, the TX is retroactively OOG.
+        // The init/call code must leave at least exec_state_gas in remaining. Tests with a
+        // reservoir (gasLimit > TX_MAX) have larger gas_remaining and rarely OOG; tests with
+        // tight gas limits leave exactly exec_state_gas in remaining (exact_gas pattern).
         if (primitives.isEnabledIn(spec, .amsterdam)) {
             const exec_state_gas = result.result.state_gas_used;
-            const reservoir: u64 = if (tx.gas_limit > interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT)
-                tx.gas_limit - interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT
-            else
-                0;
-            const reservoir_after_initial: u64 = if (reservoir > initial_gas.initial_state_gas)
-                reservoir - initial_gas.initial_state_gas
-            else
-                0;
-            const exec_state_spill: u64 = if (exec_state_gas > reservoir_after_initial)
-                exec_state_gas - reservoir_after_initial
-            else
-                0;
-            if (exec_state_spill > 0) {
-                if (exec_state_spill > result.gas_remaining) {
-                    // Retroactive OOG: state gas spill exceeds execution gas remaining.
-                    result.result.status = .Halt;
-                    total_gas_spent = tx.gas_limit;
-                } else {
-                    total_gas_spent += exec_state_spill;
-                }
+            if (exec_state_gas > result.gas_remaining) {
+                // Retroactive OOG: not enough execution gas remaining to cover state gas.
+                result.result.status = .Halt;
+                total_gas_spent = tx.gas_limit;
+            } else if (exec_state_gas > 0) {
+                total_gas_spent += exec_state_gas;
             }
         }
 
