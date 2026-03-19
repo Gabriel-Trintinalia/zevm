@@ -9,6 +9,9 @@ pub const Gas = struct {
     remaining: u64,
     /// Refunded gas. This is used only at the end of execution.
     refunded: i64,
+    /// EIP-8037 (Amsterdam+): total state gas charged during execution.
+    /// Used to compute gasUsed = max(regular_gas, state_gas) for receipts.
+    state_gas_used: u64,
     /// Memoisation of values for memory expansion cost.
     memory: MemoryGas,
 
@@ -18,6 +21,7 @@ pub const Gas = struct {
             .limit = limit,
             .remaining = limit,
             .refunded = 0,
+            .state_gas_used = 0,
             .memory = MemoryGas.new(),
         };
     }
@@ -28,6 +32,7 @@ pub const Gas = struct {
             .limit = limit,
             .remaining = 0,
             .refunded = 0,
+            .state_gas_used = 0,
             .memory = MemoryGas.new(),
         };
     }
@@ -76,6 +81,24 @@ pub const Gas = struct {
         }
         self.remaining -= amount;
         return true;
+    }
+
+    /// EIP-8037 (Amsterdam+): Record state gas incurred by this frame.
+    /// State gas is tracked independently from regular gas — it does NOT reduce
+    /// the frame's remaining gas. At the TX root, gasUsed = max(regular, state).
+    pub fn spendStateGas(self: *Gas, amount: u64) void {
+        self.state_gas_used +|= amount;
+    }
+
+    /// EIP-8037: Add state gas from a sub-frame (propagate child state_gas_used).
+    pub fn addStateGasFromChild(self: *Gas, child_state_gas: u64) void {
+        self.state_gas_used += child_state_gas;
+    }
+
+    /// EIP-8037: Undo a previous spendStateGas call (e.g. when setupCall/setupCreate fails
+    /// before an account is actually created, so no state bytes were allocated).
+    pub fn undoStateGas(self: *Gas, amount: u64) void {
+        self.state_gas_used -|= amount;
     }
 
     /// Spend all remaining gas

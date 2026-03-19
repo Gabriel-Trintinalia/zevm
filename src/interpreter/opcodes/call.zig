@@ -200,13 +200,28 @@ fn callImpl(
     const sub_gas_limit: u64 = forwarded +| stipend;
 
     // Deduct base cost then the forwarded amount from this frame's gas.
+    // EIP-v5.5.1: regular gas (base + forwarded) must be charged before state gas.
     if (!ctx.interpreter.gas.spend(base_cost)) {
         ctx.interpreter.halt(.out_of_gas);
         return;
     }
+
     if (!ctx.interpreter.gas.spend(forwarded)) {
         ctx.interpreter.halt(.out_of_gas);
         return;
+    }
+
+    // EIP-8037 (Amsterdam+): record state gas for new account creation via value-bearing CALL.
+    // G_NEWACCOUNT regular cost is removed; replaced with STATE_BYTES_PER_NEW_ACCOUNT * cpsb state gas.
+    // State gas does not reduce remaining. Tracked tentatively; undone in the .failed case
+    // if setupCall doesn't create the account (insufficient balance, stack depth, etc.).
+    var new_account_state_gas_charged: u64 = 0;
+    if (primitives.isEnabledIn(spec, .amsterdam) and transfers_value and !account_exists) {
+        const block_gas_limit = h.ctx.block.gas_limit;
+        const cpsb = gas_costs.costPerStateByte(block_gas_limit);
+        const new_account_state_gas = gas_costs.STATE_BYTES_PER_NEW_ACCOUNT * cpsb;
+        ctx.interpreter.gas.spendStateGas(new_account_state_gas);
+        new_account_state_gas_charged = new_account_state_gas;
     }
 
     // Build call inputs. For DELEGATECALL, caller and value come from parent frame.
@@ -247,6 +262,8 @@ fn callImpl(
     const setup = h.setupCall(inputs, ctx.interpreter.input.depth);
     switch (setup) {
         .failed => |r| {
+            // setupCall failed (depth limit, balance, etc.) — no account was created, undo state gas.
+            if (new_account_state_gas_charged > 0) ctx.interpreter.gas.undoStateGas(new_account_state_gas_charged);
             resumeCall(ctx.interpreter, r, ret_off_u, ret_size_u);
         },
         .precompile => |r| {
@@ -269,6 +286,7 @@ fn callImpl(
 pub fn resumeCall(interp: *Interpreter, result: host_module.CallResult, ret_off: usize, ret_size: usize) void {
     interp.gas.remaining +|= result.gas_remaining;
     interp.gas.refunded += result.gas_refunded;
+    interp.gas.addStateGasFromChild(result.state_gas_used);
 
     const actual = @min(result.return_data.len, ret_size);
     if (actual > 0) {
@@ -293,6 +311,7 @@ pub fn resumeCall(interp: *Interpreter, result: host_module.CallResult, ret_off:
 pub fn resumeCreate(interp: *Interpreter, result: host_module.CreateResult) void {
     interp.gas.remaining +|= result.gas_remaining;
     interp.gas.refunded += result.gas_refunded;
+    interp.gas.addStateGasFromChild(result.state_gas_used);
     interp.return_data.data = @constCast(result.return_data);
 
     if (!interp.stack.hasSpace(1)) {
@@ -354,8 +373,10 @@ pub fn opCreate(ctx: *InstructionContext) void {
 
     const spec = ctx.interpreter.runtime_flags.spec_id;
 
-    // Base cost
-    if (!ctx.interpreter.gas.spend(gas_costs.G_CREATE)) {
+    // Base cost: EIP-8037 (Amsterdam+) reduces regular CREATE cost from 32000 to 9000;
+    // state gas for new account + code deposit is charged separately in finalizeCreate.
+    const create_base_cost: u64 = if (primitives.isEnabledIn(spec, .amsterdam)) 9000 else gas_costs.G_CREATE;
+    if (!ctx.interpreter.gas.spend(create_base_cost)) {
         ctx.interpreter.halt(.out_of_gas);
         return;
     }
@@ -382,8 +403,10 @@ pub fn opCreate(ctx: *InstructionContext) void {
     }
 
     // EIP-3860 (Shanghai+): oversized initcode causes exceptional halt in calling frame.
+    // EIP-7954 (Amsterdam+): max initcode doubles to 98304 (2 * 49152).
     if (primitives.isEnabledIn(spec, .shanghai)) {
-        if (size_u > 49152) { // MAX_INITCODE_SIZE = 2 * 24576
+        const max_initcode: usize = if (primitives.isEnabledIn(spec, .amsterdam)) 98304 else 49152;
+        if (size_u > max_initcode) {
             ctx.interpreter.halt(.out_of_gas);
             return;
         }
@@ -465,7 +488,9 @@ pub fn opCreate2(ctx: *InstructionContext) void {
 
     const spec = ctx.interpreter.runtime_flags.spec_id;
 
-    if (!ctx.interpreter.gas.spend(gas_costs.G_CREATE)) {
+    // EIP-8037 (Amsterdam+): same reduced regular cost as CREATE.
+    const create2_base_cost: u64 = if (primitives.isEnabledIn(spec, .amsterdam)) 9000 else gas_costs.G_CREATE;
+    if (!ctx.interpreter.gas.spend(create2_base_cost)) {
         ctx.interpreter.halt(.out_of_gas);
         return;
     }
@@ -491,8 +516,10 @@ pub fn opCreate2(ctx: *InstructionContext) void {
     }
 
     // EIP-3860 (Shanghai+): oversized initcode causes exceptional halt in calling frame.
+    // EIP-7954 (Amsterdam+): max initcode doubles to 98304 (2 * 49152).
     if (primitives.isEnabledIn(spec, .shanghai)) {
-        if (size_u > 49152) { // MAX_INITCODE_SIZE = 2 * 24576
+        const max_initcode: usize = if (primitives.isEnabledIn(spec, .amsterdam)) 98304 else 49152;
+        if (size_u > max_initcode) {
             ctx.interpreter.halt(.out_of_gas);
             return;
         }

@@ -209,13 +209,21 @@ pub const MainnetHandler = struct {
                                     // EIP-7702 refund: the intrinsic cost charges PER_EMPTY_ACCOUNT_COST
                                     // (25,000) for each authorization to cover possible new-account creation.
                                     // If the authority already exists (non-empty), no new account is created,
-                                    // so refund PER_EMPTY_ACCOUNT_COST / 2 = 12,500.
+                                    // so refund PER_EMPTY_ACCOUNT_COST / 2 = 12,500 (Prague).
+                                    // EIP-8037 (Amsterdam+): refund 112*cpsb state gas per existing auth
+                                    // (bypasses 1/5 cap — it's a pre-payment correction, not an SSTORE reward).
                                     // An account is non-empty if: nonce > 0, balance > 0, or code != empty.
                                     const is_existing = journaled.account.info.nonce > 0 or
                                         journaled.account.info.balance > 0 or
                                         !std.mem.eql(u8, &journaled.account.info.code_hash, &primitives.KECCAK_EMPTY);
                                     if (is_existing) {
-                                        initial_gas.auth_refund += 12500;
+                                        if (primitives.isEnabledIn(spec, .amsterdam)) {
+                                            const gas_costs = interpreter_mod.gas_costs;
+                                            const cpsb = gas_costs.costPerStateByte(ctx.block.gas_limit);
+                                            initial_gas.auth_state_refund += gas_costs.STATE_BYTES_PER_NEW_ACCOUNT * cpsb;
+                                        } else {
+                                            initial_gas.auth_refund += 12500;
+                                        }
                                     }
 
                                     // Bump authority nonce (journaled, revertable).
@@ -285,9 +293,11 @@ pub const MainnetHandler = struct {
                             exec_gas,
                         );
                         const ir = try executeIterative(root_interp, &host, &return_data_buf);
-                        const cr = host.finalizeCreate(s.checkpoint, s.new_addr, ir.raw_result, ir.gas_remaining, ir.gas_refunded, ir.return_data, spec);
+                        var cr = host.finalizeCreate(s.checkpoint, s.new_addr, ir.raw_result, ir.gas_remaining, ir.gas_refunded, ir.return_data, spec, false);
+                        cr.state_gas_used += ir.state_gas_used;
                         const cr_status: main.ExecutionStatus = if (cr.success) .Success else if (cr.is_revert) .Revert else .Halt;
                         var exec_result = main.ExecutionResult.new(cr_status, exec_gas - cr.gas_remaining);
+                        exec_result.state_gas_used = cr.state_gas_used;
                         exec_result.return_data = alloc_mod.get().dupe(u8, cr.return_data) catch @constCast(&[_]u8{});
                         return main.FrameResult.new(exec_result, cr.gas_remaining, cr.gas_refunded);
                     },
@@ -321,6 +331,12 @@ pub const MainnetHandler = struct {
                             0,
                             0,
                         );
+                    }
+                    // EIP-7708 (Amsterdam+): emit Transfer log for ETH sent via TX.
+                    if (primitives.isEnabledIn(spec, .amsterdam) and
+                        !std.mem.eql(u8, &tx.caller, &target))
+                    {
+                        ctx.journaled_state.emitTransferLog(tx.caller, target, tx.value);
                     }
                 }
 
@@ -386,6 +402,7 @@ pub const MainnetHandler = struct {
                     else => .Halt,
                 };
                 var exec_result = main.ExecutionResult.new(status, exec_gas - ir.gas_remaining);
+                exec_result.state_gas_used = ir.state_gas_used;
                 exec_result.return_data = alloc_mod.get().dupe(u8, ir.return_data) catch @constCast(&[_]u8{});
                 return main.FrameResult.new(exec_result, ir.gas_remaining, ir.gas_refunded);
             },
@@ -433,13 +450,19 @@ pub const MainnetHandler = struct {
         else
             0;
         const auth_refund = @as(u64, @intCast(@max(0, initial_gas.auth_refund)));
+        // EIP-8037 (Amsterdam+): auth_state_refund (112*cpsb per valid existing auth) bypasses
+        // the 1/5 cap — it is a pre-payment correction, not an SSTORE clearing reward.
+        const auth_state_refund: u64 = if (primitives.isEnabledIn(spec, .amsterdam))
+            initial_gas.auth_state_refund
+        else
+            0;
         const raw_refund: u64 = exec_refund + auth_refund;
         const quotient: u64 = if (is_london) 5 else 2;
         // EIP-3529 refund cap: min(refund, gas_used / max_refund_quotient) where gas_used is
         // the TOTAL gas consumed (intrinsic + execution), not just execution gas.
         // Per Yellow Paper: g* = gas_limit - gas_remaining_after_exec = total_gas_spent.
         var capped_refund = @min(raw_refund, total_gas_spent / quotient);
-        var final_cost = total_gas_spent - capped_refund;
+        var final_cost = total_gas_spent - capped_refund - auth_state_refund;
 
         if (primitives.isEnabledIn(spec, .prague) and !ctx.cfg.disable_eip7623 and initial_gas.floor_gas > 0) {
             // floor_total = TX_BASE_COST + floor_exec_gas (validated: gas_limit >= floor_total)
@@ -448,6 +471,18 @@ pub const MainnetHandler = struct {
                 final_cost = floor_total;
                 capped_refund = 0;
             }
+        }
+
+        // EIP-8037 (Amsterdam+): for failed txs, receipt gas = min(regular_spent, TX_MAX) + initial_state_gas.
+        // This caps the sender's fee on failed large txs at TX_MAX regular + state intrinsic.
+        if (primitives.isEnabledIn(spec, .amsterdam) and result.result.status != .Success) {
+            capped_refund = 0;
+            const regular_spent = total_gas_spent -| initial_gas.initial_state_gas;
+            const net_state = if (initial_gas.initial_state_gas > auth_state_refund)
+                initial_gas.initial_state_gas - auth_state_refund
+            else
+                0;
+            final_cost = @min(regular_spent, interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT) + net_state;
         }
 
         // 3. Effective gas price (EIP-1559 aware)
@@ -475,15 +510,51 @@ pub const MainnetHandler = struct {
 
         // 6. Extract logs before commitTx destroys them (only on success — reverted state has no logs).
         if (result.result.status == .Success) {
+            // EIP-7708 (Amsterdam+): emit deferred burn logs (sorted by address) after coinbase payment.
+            if (primitives.isEnabledIn(spec, .amsterdam)) {
+                js.emitBurnLogs();
+            }
             result.result.logs = js.takeLogs();
         }
 
         // 7. Commit transaction state
         js.commitTx();
 
-        // 8. Update ExecutionResult with final accounting
+        // 8. Update ExecutionResult with final accounting.
+        // EIP-7778 (Amsterdam+): block gas does NOT deduct refunds.
+        //   block_base = final_cost + capped_refund (= total_gas_spent when no floor,
+        //   = floor_total when floor applied since capped_refund=0 in that case).
+        // EIP-8037 (Amsterdam+):
+        //   - receipt cumulativeGasUsed = final_cost (= regular_after_refunds + state)
+        //   - block gasUsed = max(regular_before_refunds, state_gas) (no refunds deducted)
+        if (primitives.isEnabledIn(spec, .amsterdam)) {
+            // block_base = total_gas_spent - auth_state_refund (SSTORE refunds NOT deducted per EIP-7778;
+            // auth_state_refund IS deducted as it is a pre-payment correction, not an SSTORE reward).
+            const block_base = final_cost + capped_refund;
+            if (result.result.status == .Success) {
+                const total_state_gross = initial_gas.initial_state_gas + result.result.state_gas_used;
+                const total_state = if (total_state_gross > auth_state_refund)
+                    total_state_gross - auth_state_refund
+                else
+                    0;
+                const regular_for_block = if (block_base > total_state) block_base - total_state else 0;
+                result.result.block_gas_used = @max(regular_for_block, total_state);
+            } else {
+                // EIP-8037 (Amsterdam+): failed tx block gas capped at TX_MAX_GAS_LIMIT (1<<24).
+                // Txs with gas > TX_MAX are allowed but contribute at most TX_MAX to block capacity on failure.
+                result.result.block_gas_used = @min(block_base, interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT);
+            }
+        } else {
+            result.result.block_gas_used = final_cost;
+        }
         result.result.gas_used = final_cost;
         result.result.gas_refunded = capped_refund;
+
+        if (primitives.isEnabledIn(spec, .amsterdam)) {
+            std.debug.print("[dbg] amsterdam post: total_gas_spent={} initial_gas={} initial_state={} auth_state_refund={} exec_refund={} capped={} final_cost={} block_gas_used={}\n", .{
+                total_gas_spent, initial_gas.initial_gas, initial_gas.initial_state_gas, auth_state_refund, exec_refund, capped_refund, final_cost, result.result.block_gas_used,
+            });
+        }
     }
 
     /// Handle errors — revert journal, discard tx.
@@ -500,6 +571,8 @@ const IterativeResult = struct {
     gas_remaining: u64,
     gas_refunded: i64,
     return_data: []const u8, // points into return_data_buf; valid until buf is cleared
+    /// EIP-8037 (Amsterdam+): total state gas charged across all frames.
+    state_gas_used: u64,
 };
 
 /// One entry on the iterative call stack.
@@ -594,6 +667,7 @@ fn executeIterative(
                 const raw = frame.interp.result;
                 const gas_rem = frame.interp.gas.remaining;
                 const gas_ref = frame.interp.gas.refunded;
+                const root_state_gas = frame.interp.gas.state_gas_used;
                 const rd_raw: []const u8 = if (raw.isSuccess() or raw == .revert)
                     frame.interp.return_data.data
                 else
@@ -606,6 +680,7 @@ fn executeIterative(
                     .gas_remaining = gas_rem,
                     .gas_refunded = gas_ref,
                     .return_data = return_data_buf.items,
+                    .state_gas_used = root_state_gas,
                 };
             }
 
@@ -613,6 +688,7 @@ fn executeIterative(
             const sub_result = frame.interp.result;
             const sub_gas_rem = frame.interp.gas.remaining;
             const sub_gas_ref = frame.interp.gas.refunded;
+            const sub_state_gas = frame.interp.gas.state_gas_used;
             const rd_raw: []const u8 = if (sub_result.isSuccess() or sub_result == .revert)
                 frame.interp.return_data.data
             else
@@ -628,11 +704,21 @@ fn executeIterative(
 
             switch (cause) {
                 .call => |pc| {
-                    const r = host.finalizeCall(pc.checkpoint, sub_result, pc.inputs.gas_limit, sub_gas_rem, sub_gas_ref, return_data_buf.items);
+                    var r = host.finalizeCall(pc.checkpoint, sub_result, pc.inputs.gas_limit, sub_gas_rem, sub_gas_ref, return_data_buf.items);
+                    // EIP-8037: propagate child state gas to parent only on success.
+                    // On revert/failure, state gas is not propagated (reverted state = no new state bytes).
+                    // State gas never reduces frame gas_remaining, so no restoration needed.
+                    r.state_gas_used = if (r.success) sub_state_gas else 0;
                     call_ops.resumeCall(&parent.interp, r, pc.ret_off, pc.ret_size);
                 },
                 .create => |pc| {
-                    const r = host.finalizeCreate(pc.checkpoint, pc.new_addr, sub_result, sub_gas_rem, sub_gas_ref, return_data_buf.items, parent_spec);
+                    var r = host.finalizeCreate(pc.checkpoint, pc.new_addr, sub_result, sub_gas_rem, sub_gas_ref, return_data_buf.items, parent_spec, true);
+                    // EIP-8037: on success, add child's accumulated state gas (from nested ops in initcode).
+                    // On failure, state gas from sub-frame (reverted) is not propagated.
+                    // State gas never reduces frame gas_remaining, so no restoration needed.
+                    if (r.success) {
+                        r.state_gas_used += sub_state_gas;
+                    }
                     call_ops.resumeCreate(&parent.interp, r);
                 },
             }

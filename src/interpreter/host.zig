@@ -26,16 +26,19 @@ pub const CallResult = struct {
     /// EIP-7702: gas charged for loading the delegation target (if any).
     /// Must be deducted from the parent frame's remaining gas after the call.
     delegation_gas: u64,
+    /// EIP-8037 (Amsterdam+): state gas charged in the sub-call.
+    /// Must be added to parent frame's gas.state_gas_used on return.
+    state_gas_used: u64,
 
     /// Sub-call failed after execution (all gas consumed).
     pub fn failure(gas_limit: u64) CallResult {
-        return .{ .success = false, .return_data = &[_]u8{}, .gas_used = gas_limit, .gas_remaining = 0, .gas_refunded = 0, .delegation_gas = 0 };
+        return .{ .success = false, .return_data = &[_]u8{}, .gas_used = gas_limit, .gas_remaining = 0, .gas_refunded = 0, .delegation_gas = 0, .state_gas_used = 0 };
     }
 
     /// Sub-call failed BEFORE execution (depth limit, value-transfer failure).
     /// Per EVM spec: when no sub-code runs, all forwarded gas is returned to caller.
     pub fn preExecFailure(gas_limit: u64) CallResult {
-        return .{ .success = false, .return_data = &[_]u8{}, .gas_used = 0, .gas_remaining = gas_limit, .gas_refunded = 0, .delegation_gas = 0 };
+        return .{ .success = false, .return_data = &[_]u8{}, .gas_used = 0, .gas_remaining = gas_limit, .gas_refunded = 0, .delegation_gas = 0, .state_gas_used = 0 };
     }
 };
 
@@ -78,15 +81,18 @@ pub const CreateResult = struct {
     return_data: []const u8,
     /// Refund counter accumulated inside the init-code sub-interpreter.
     gas_refunded: i64,
+    /// EIP-8037 (Amsterdam+): state gas charged in the sub-call.
+    /// Must be added to parent frame's gas.state_gas_used on return.
+    state_gas_used: u64,
 
     /// Pre-execution failure: no sub-interpreter ran, return all forwarded gas.
     pub fn preExecFailure(gas_limit: u64) CreateResult {
-        return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = gas_limit, .return_data = &[_]u8{}, .gas_refunded = 0 };
+        return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = gas_limit, .return_data = &[_]u8{}, .gas_refunded = 0, .state_gas_used = 0 };
     }
 
     /// Post-execution failure: sub-interpreter ran and consumed gas.
     pub fn failure() CreateResult {
-        return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0 };
+        return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0, .state_gas_used = 0 };
     }
 };
 
@@ -146,6 +152,10 @@ pub const Host = struct {
 
     pub fn basefee(self: *Host) u64 {
         return self.ctx.block.basefee;
+    }
+
+    pub fn slotNumber(self: *Host) u64 {
+        return self.ctx.block.slot_number;
     }
 
     pub fn blobBasefee(self: *Host) u128 {
@@ -307,13 +317,19 @@ pub const Host = struct {
                         self.ctx.journaled_state.checkpointRevert(cp);
                         return .{ .precompile = CallResult.preExecFailure(inputs.gas_limit) };
                     }
+                    // EIP-7708 (Amsterdam+): emit Transfer log for ETH sent to precompile.
+                    if (primitives.isEnabledIn(self.ctx.cfg.spec, .amsterdam) and
+                        !std.mem.eql(u8, &inputs.caller, &inputs.target))
+                    {
+                        self.ctx.journaled_state.emitTransferLog(inputs.caller, inputs.target, inputs.value);
+                    }
                 }
                 const pc_result = pc.execute(inputs.data, inputs.gas_limit);
                 switch (pc_result) {
                     .success => |out| {
                         if (out.reverted) {
                             self.ctx.journaled_state.checkpointRevert(cp);
-                            return .{ .precompile = .{ .success = false, .return_data = out.bytes, .gas_used = inputs.gas_limit, .gas_remaining = 0, .gas_refunded = 0, .delegation_gas = 0 } };
+                            return .{ .precompile = .{ .success = false, .return_data = out.bytes, .gas_used = inputs.gas_limit, .gas_remaining = 0, .gas_refunded = 0, .delegation_gas = 0, .state_gas_used = 0 } };
                         }
                         self.ctx.journaled_state.checkpointCommit();
                         // Touch the callee so it appears in post-state for pre-EIP-161 forks
@@ -321,7 +337,7 @@ pub const Host = struct {
                         // accountInfo() in the CALL opcode handler. For EIP-161+ forks, the
                         // empty account will be cleaned up by the state-clear logic anyway.
                         self.ctx.journaled_state.touchAccount(inputs.callee);
-                        return .{ .precompile = .{ .success = true, .return_data = out.bytes, .gas_used = out.gas_used, .gas_remaining = inputs.gas_limit - out.gas_used, .gas_refunded = 0, .delegation_gas = 0 } };
+                        return .{ .precompile = .{ .success = true, .return_data = out.bytes, .gas_used = out.gas_used, .gas_remaining = inputs.gas_limit - out.gas_used, .gas_refunded = 0, .delegation_gas = 0, .state_gas_used = 0 } };
                     },
                     .err => {
                         self.ctx.journaled_state.checkpointRevert(cp);
@@ -364,6 +380,12 @@ pub const Host = struct {
                 self.ctx.journaled_state.checkpointRevert(checkpoint);
                 return .{ .failed = CallResult.preExecFailure(inputs.gas_limit) };
             }
+            // EIP-7708 (Amsterdam+): emit Transfer log for ETH sent via CALL.
+            if (primitives.isEnabledIn(self.ctx.cfg.spec, .amsterdam) and
+                !std.mem.eql(u8, &inputs.caller, &inputs.target))
+            {
+                self.ctx.journaled_state.emitTransferLog(inputs.caller, inputs.target, inputs.value);
+            }
         }
 
         return .{ .ready = .{ .checkpoint = checkpoint, .code = code, .delegation_gas = delegation_gas } };
@@ -395,6 +417,7 @@ pub const Host = struct {
             .gas_remaining = gas_rem,
             .gas_refunded = refunded,
             .delegation_gas = 0,
+            .state_gas_used = 0, // set by caller after finalizeCall
         };
     }
 
@@ -412,11 +435,10 @@ pub const Host = struct {
         frame_depth: usize,
     ) CreateSetupResult {
         const MAX_CALL_DEPTH = 1024;
-        const MAX_CODE_SIZE: usize = 24576;
-        const MAX_INITCODE_SIZE: usize = 2 * MAX_CODE_SIZE;
-
         const js = &self.ctx.journaled_state;
         const spec_id = js.inner.spec;
+        const MAX_CODE_SIZE: usize = if (primitives.isEnabledIn(spec_id, .amsterdam)) 32768 else 24576;
+        const MAX_INITCODE_SIZE: usize = 2 * MAX_CODE_SIZE;
 
         if (frame_depth >= MAX_CALL_DEPTH) return .{ .failed = CreateResult.preExecFailure(gas_limit) };
 
@@ -472,6 +494,11 @@ pub const Host = struct {
             return .{ .failed = CreateResult.preExecFailure(0) };
         };
 
+        // EIP-7708 (Amsterdam+): emit Transfer log for ETH sent to the new contract.
+        if (value > 0 and primitives.isEnabledIn(spec_id, .amsterdam)) {
+            js.emitTransferLog(caller, new_addr, value);
+        }
+
         return .{ .ready = .{ .checkpoint = checkpoint, .new_addr = new_addr } };
     }
 
@@ -486,40 +513,66 @@ pub const Host = struct {
         gas_refunded: i64,
         return_data: []const u8,
         spec_id: primitives.SpecId,
+        /// EIP-8037: true when called from CREATE/CREATE2 opcode. false for TX-level create
+        /// (TX-level new account state gas is already in initial_state_gas, not charged here).
+        is_opcode_create: bool,
     ) CreateResult {
-        const MAX_CODE_SIZE: usize = 24576;
+        const MAX_CODE_SIZE: usize = if (primitives.isEnabledIn(spec_id, .amsterdam)) 32768 else 24576;
         const js = &self.ctx.journaled_state;
 
         if (!result.isSuccess()) {
             js.checkpointRevert(checkpoint);
             const gas_rem = if (result == .revert) gas_remaining else @as(u64, 0);
             const rd = if (result == .revert) return_data else &[_]u8{};
-            return .{ .success = false, .is_revert = (result == .revert), .address = [_]u8{0} ** 20, .gas_remaining = gas_rem, .return_data = rd, .gas_refunded = 0 };
+            // EIP-8037: on failure/revert, no state bytes are committed, so no state gas is charged.
+            return .{ .success = false, .is_revert = (result == .revert), .address = [_]u8{0} ** 20, .gas_remaining = gas_rem, .return_data = rd, .gas_refunded = 0, .state_gas_used = 0 };
         }
 
         const deployed_raw = return_data;
         if (deployed_raw.len > MAX_CODE_SIZE) {
             js.checkpointRevert(checkpoint);
-            return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0 };
+            return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0, .state_gas_used = 0 };
         }
         if (primitives.isEnabledIn(spec_id, .london)) {
             if (deployed_raw.len > 0 and deployed_raw[0] == 0xEF) {
                 js.checkpointRevert(checkpoint);
-                return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0 };
+                return .{ .success = false, .is_revert = false, .address = [_]u8{0} ** 20, .gas_remaining = 0, .return_data = &[_]u8{}, .gas_refunded = 0, .state_gas_used = 0 };
             }
         }
 
-        const deposit_cost = gas_costs.G_CODEDEPOSIT * @as(u64, @intCast(deployed_raw.len));
-        if (gas_remaining < deposit_cost) {
-            if (primitives.isEnabledIn(spec_id, .homestead)) {
+        // EIP-8037 (Amsterdam+): code deposit regular cost = G_KECCAK256WORD per word (replaces 200/byte).
+        // State gas = (new_account_bytes + code_len) * cpsb is tracked but does NOT reduce gas_remaining.
+        var gas_after_deposit: u64 = undefined;
+        var code_deposit_state_gas: u64 = 0;
+        if (primitives.isEnabledIn(spec_id, .amsterdam)) {
+            const code_words = (deployed_raw.len + 31) / 32;
+            const regular_deposit = gas_costs.G_KECCAK256WORD * @as(u64, code_words);
+            if (gas_remaining < regular_deposit) {
                 js.checkpointRevert(checkpoint);
                 return CreateResult.failure();
-            } else {
-                js.checkpointCommit();
-                return .{ .success = true, .is_revert = false, .address = new_addr, .gas_remaining = gas_remaining, .return_data = &[_]u8{}, .gas_refunded = gas_refunded };
             }
+            const gas_after_regular = gas_remaining - regular_deposit;
+            const cpsb = gas_costs.costPerStateByte(self.ctx.block.gas_limit);
+            // EIP-8037: state gas = (new_account_bytes + code_len) * cpsb.
+            // For opcode CREATE/CREATE2: new_account_bytes = STATE_BYTES_PER_NEW_ACCOUNT.
+            // For TX-level create: new_account_bytes = 0 (already in initial_state_gas).
+            const new_account_bytes: u64 = if (is_opcode_create) gas_costs.STATE_BYTES_PER_NEW_ACCOUNT else 0;
+            code_deposit_state_gas = (new_account_bytes + @as(u64, deployed_raw.len)) * cpsb;
+            // State gas does not reduce remaining — tracked separately for gasUsed = max(regular, state).
+            gas_after_deposit = gas_after_regular;
+        } else {
+            const deposit_cost = gas_costs.G_CODEDEPOSIT * @as(u64, @intCast(deployed_raw.len));
+            if (gas_remaining < deposit_cost) {
+                if (primitives.isEnabledIn(spec_id, .homestead)) {
+                    js.checkpointRevert(checkpoint);
+                    return CreateResult.failure();
+                } else {
+                    js.checkpointCommit();
+                    return .{ .success = true, .is_revert = false, .address = new_addr, .gas_remaining = gas_remaining, .return_data = &[_]u8{}, .gas_refunded = gas_refunded, .state_gas_used = 0 };
+                }
+            }
+            gas_after_deposit = gas_remaining - deposit_cost;
         }
-        const gas_after_deposit = gas_remaining - deposit_cost;
 
         if (deployed_raw.len > 0) {
             const deployed_copy = alloc_mod.get().dupe(u8, deployed_raw) catch {
@@ -533,7 +586,7 @@ pub const Host = struct {
         }
 
         js.checkpointCommit();
-        return .{ .success = true, .is_revert = false, .address = new_addr, .gas_remaining = gas_after_deposit, .return_data = &[_]u8{}, .gas_refunded = gas_refunded };
+        return .{ .success = true, .is_revert = false, .address = new_addr, .gas_remaining = gas_after_deposit, .return_data = &[_]u8{}, .gas_refunded = gas_refunded, .state_gas_used = code_deposit_state_gas };
     }
 
     // -----------------------------------------------------------------------
@@ -567,7 +620,9 @@ pub const Host = struct {
                 var rd_buf: std.ArrayList(u8) = .{};
                 defer rd_buf.deinit(alloc_mod.get());
                 rd_buf.appendSlice(alloc_mod.get(), rd) catch {};
-                return self.finalizeCall(s.checkpoint, sub_interp.result, inputs.gas_limit, sub_interp.gas.remaining, sub_interp.gas.refunded, rd_buf.items);
+                var call_result = self.finalizeCall(s.checkpoint, sub_interp.result, inputs.gas_limit, sub_interp.gas.remaining, sub_interp.gas.refunded, rd_buf.items);
+                call_result.state_gas_used = sub_interp.gas.state_gas_used;
+                return call_result;
             },
         }
     }
@@ -607,7 +662,9 @@ pub const Host = struct {
                 var rd_buf: std.ArrayList(u8) = .{};
                 defer rd_buf.deinit(alloc_mod.get());
                 rd_buf.appendSlice(alloc_mod.get(), rd) catch {};
-                return self.finalizeCreate(s.checkpoint, s.new_addr, sub_interp.result, sub_interp.gas.remaining, sub_interp.gas.refunded, rd_buf.items, spec_id);
+                var create_result = self.finalizeCreate(s.checkpoint, s.new_addr, sub_interp.result, sub_interp.gas.remaining, sub_interp.gas.refunded, rd_buf.items, spec_id, true);
+                create_result.state_gas_used += sub_interp.gas.state_gas_used;
+                return create_result;
             },
         }
     }
