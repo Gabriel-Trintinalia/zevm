@@ -440,7 +440,42 @@ pub const MainnetHandler = struct {
         //
         // Using exec-only arithmetic would cause underflow when floor_tokens*10 > exec_gas
         // (which is common: floor=40/nonzero-byte vs standard=16/nonzero-byte calldata gas).
-        const total_gas_spent = initial_gas.initial_gas + gas_spent;
+        var total_gas_spent = initial_gas.initial_gas + gas_spent;
+
+        // EIP-8037 (Amsterdam+): reservoir model — state gas beyond the reservoir spills into
+        // execution gas, increasing total_gas_spent and the sender's fee.
+        //
+        // When gasLimit > TX_MAX_GAS_LIMIT (1<<24), the excess forms a "reservoir" that absorbs
+        // state gas first (invisible to EVM execution). Any state gas beyond the remaining
+        // reservoir capacity spills back into execution gas: total_gas_spent += spill.
+        // If the spill exceeds gas_remaining, the TX is retroactively OOG (all gas consumed).
+        //
+        // initial_state_gas is already included in initial_gas.initial_gas and draws from the
+        // reservoir first; only exec state gas (result.state_gas_used) needs the spill check.
+        if (primitives.isEnabledIn(spec, .amsterdam)) {
+            const exec_state_gas = result.result.state_gas_used;
+            const reservoir: u64 = if (tx.gas_limit > interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT)
+                tx.gas_limit - interpreter_mod.gas_costs.TX_MAX_GAS_LIMIT
+            else
+                0;
+            const reservoir_after_initial: u64 = if (reservoir > initial_gas.initial_state_gas)
+                reservoir - initial_gas.initial_state_gas
+            else
+                0;
+            const exec_state_spill: u64 = if (exec_state_gas > reservoir_after_initial)
+                exec_state_gas - reservoir_after_initial
+            else
+                0;
+            if (exec_state_spill > 0) {
+                if (exec_state_spill > result.gas_remaining) {
+                    // Retroactive OOG: state gas spill exceeds execution gas remaining.
+                    result.result.status = .Halt;
+                    total_gas_spent = tx.gas_limit;
+                } else {
+                    total_gas_spent += exec_state_spill;
+                }
+            }
+        }
 
         // SSTORE clearing refund (exec_refund) only on Success (state was not reverted).
         // EIP-7702 auth_refund applies regardless of execution outcome because authorization
